@@ -11,6 +11,16 @@ settle holds one credit first. It confirms that hold only when three checks
 pass: the print-design app (doctor), the delivery-package check, and the
 customer's locked artwork. If any check fails, it releases the hold.
 
+doctor also calls the billing service's read-only /health endpoint. A
+certificate failure names Install Certificates.command. Every billing
+request sends User-Agent foldyn-skill/<version>. A dropped connection is
+retried once with the same idempotency key.
+
+An open hold lasts 30 minutes. After that the service releases it and
+returns the credit. settle then uses the next idempotency key, which can
+hold a new credit. Repeating a key that is still held or already confirmed
+does not hold a second credit.
+
 Token, first match wins:
   FOLDYN_BILLING_TOKEN
   token in ~/.cache/foldyn/billing.json
@@ -21,14 +31,31 @@ URL, first match wins:
 
 The token is not written into the job directory.
 """
+import http.client
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 DEFAULT_URL = "https://billing.foldyn.co.uk"
+# Sent on every billing request. urllib's default Python-urllib UA is
+# rejected by Cloudflare error 1010 in front of the billing host.
+CLIENT_VERSION = "1.1.0"
+USER_AGENT = f"foldyn-skill/{CLIENT_VERSION}"
+# One retry after the first attempt. The body, including the idempotency key, stays the same.
+_NETWORK_TRIES = 2
+CERT_MESSAGE = (
+    "billing API certificate could not be verified (CERTIFICATE_VERIFY_FAILED). "
+    "The python.org macOS installer does not include root certificates until you run "
+    "Install Certificates.command in the Python folder under /Applications "
+    "(for example /Applications/Python 3.11/Install Certificates.command). "
+    "Or install certifi (pip install certifi); this client uses it automatically "
+    "when SSL_CERT_FILE is not set. You can also set SSL_CERT_FILE to the path from "
+    'python -c "import certifi; print(certifi.where())".'
+)
 APP_PATH = "/Applications/Adobe Illustrator 2026"
 RECORD_NAME = "skill_credit.json"
 LOCK_NAME = "artwork_locked.json"
@@ -70,17 +97,33 @@ def _osascript_version():
     return completed.returncode == 0 and bool(completed.stdout.strip())
 
 
-def doctor(app_path=APP_PATH, runner=None, platform=None):
-    ok = illustrator_ready(app_path=app_path, runner=runner, platform=platform)
-    if ok:
-        print("OK   print-design app")
-        print("DOCTOR PASS")
+def doctor(app_path=APP_PATH, runner=None, platform=None, probe=None, base_url=None):
+    """App gate plus one read-only call to the billing service.
+
+    probe replaces the health call in tests. It raises SkillCreditError on failure.
+    """
+    app_ok = illustrator_ready(app_path=app_path, runner=runner, platform=platform)
+    lines = []
+    if app_ok:
+        lines.append("OK   print-design app")
     else:
-        print(
+        lines.append(
             "MISS print-design app   -> install Adobe Illustrator on this Mac and allow automation"
         )
-        print("DOCTOR FAIL")
-    return ok
+    billing_ok = True
+    try:
+        if probe is None:
+            billing_reachable(base_url)
+        else:
+            probe()
+    except SkillCreditError as exc:
+        billing_ok = False
+        lines.append(f"MISS billing service   -> {exc}")
+    else:
+        lines.append("OK   billing service")
+    lines.append("DOCTOR PASS" if app_ok and billing_ok else "DOCTOR FAIL")
+    print("\n".join(lines))
+    return app_ok and billing_ok
 
 
 def package_ok(job_dir):
@@ -148,6 +191,29 @@ def load_billing(environ=None, config_path=None):
     return _check_base(url or DEFAULT_URL), token
 
 
+def billing_base(environ=None, config_path=None):
+    """Billing origin for the health check. A token is not required."""
+    env = os.environ if environ is None else environ
+    path = config_path or os.path.join(
+        os.path.expanduser("~/.cache/foldyn"), "billing.json"
+    )
+    file_data = _config_file(path)
+    url = (env.get("FOLDYN_BILLING_URL") or "").strip()
+    if not url:
+        url = str(file_data.get("url") or "").strip()
+    return _check_base(url or DEFAULT_URL)
+
+
+def billing_reachable(base_url=None, environ=None, config_path=None, get=None):
+    """GET /health. Read-only: it does not send the account token."""
+    base = _check_base(base_url) if base_url else billing_base(environ, config_path)
+    fetch = get or _urllib_get
+    status, body = fetch(base + "/health")
+    if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
+        raise SkillCreditError(f"billing service health check failed (HTTP {status})")
+    return True
+
+
 def _check_base(url):
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
@@ -180,31 +246,85 @@ class BillingClient:
         return body
 
 
-def _urllib_post(url, payload, token):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "content-type": "application/json",
-            "authorization": f"Bearer {token}",
-        },
-    )
+class _Dropped(Exception):
+    def __init__(self, cause):
+        super().__init__("dropped")
+        self.cause = cause
+
+
+def _is_certificate_error(exc):
+    current = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        text = str(current)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text.lower():
+            return True
+        nxt = getattr(current, "reason", None)
+        if nxt is None or nxt is current:
+            nxt = getattr(current, "__cause__", None)
+        current = nxt if nxt is not current else None
+    return False
+
+
+def _ssl_context():
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _urllib_once(url, payload, token, method):
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
             raw = resp.read()
             status = resp.status
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         status = exc.code
-    except urllib.error.URLError as exc:
-        raise SkillCreditError("billing API could not be reached") from exc
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError, http.client.HTTPException, OSError) as exc:
+        if _is_certificate_error(exc):
+            raise SkillCreditError(CERT_MESSAGE) from exc
+        raise _Dropped(exc) from exc
     try:
         body = json.loads(raw.decode("utf-8")) if raw else {}
     except json.JSONDecodeError:
         body = {}
     return status, body
+
+
+def _urllib_exchange(url, payload, token, method):
+    dropped = None
+    for _attempt in range(_NETWORK_TRIES):
+        try:
+            return _urllib_once(url, payload, token, method)
+        except _Dropped as exc:
+            dropped = exc
+    raise SkillCreditError("billing API could not be reached") from dropped.cause
+
+
+def _urllib_post(url, payload, token):
+    return _urllib_exchange(url, payload, token, "POST")
+
+
+def _urllib_get(url):
+    return _urllib_exchange(url, None, None, "GET")
 
 
 def _job_meta(job_dir):
@@ -321,6 +441,10 @@ def release(job_dir, client):
 def settle(job_dir, client, software=None):
     """Hold one credit, then confirm or release. software() overrides the app check."""
     record = open_hold(job_dir, client)
+    if record.get("status") == "released":
+        # That key is finished. open_hold moves to the next attempt only after
+        # the saved status is released, so this second call does not reuse it.
+        record = open_hold(job_dir, client)
     if record.get("status") == "confirmed":
         record["failed"] = []
         return write_record(job_dir, record)
